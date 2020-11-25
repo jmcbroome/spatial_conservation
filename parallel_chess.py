@@ -12,6 +12,8 @@ import time
 import math
 import traceback
 import glob
+import cooler
+import numpy as np
 
 def argparser():
     parser = argparse.ArgumentParser()
@@ -66,6 +68,42 @@ def run_commands(commands, log):
 
 def split_matrices(pairs, rmatrix, qmatrix, log, threads = 24):
     '''
+    Use the cooler API to create new subcoolers representing various individual chromosomes in the set for downstream parallelization.
+    Doesn't suffer from chromosome name inconsistency issues in the same way the hicexplorer implementation does
+    Not multithreaded but that shouldn't add much overall to the runtime for this step.
+    '''
+    rchros = list(set([k[0] for k in pairs.keys()]))
+    qchros = list(set([k[1] for k in pairs.keys()]))
+    log.append("Splitting coolers; {} chromosome targets".format(len(rchros) + len(qchros)))
+    outd = {}
+    rcool = cooler.Cooler(rmatrix)
+    qcool = cooler.Cooler(qmatrix)
+    for rc in rchros:
+        #extract the bins and pixels which match this from the selector
+        df = rcool.bins()[0:]
+        bins = df[df['chrom'] == rc]
+        pdf = rcool.pixels()[0:]
+        pixels = pdf[(pdf['bin1_id'].apply(lambda x:x in bins.index)) & (pdf['bin2_id'].apply(lambda x:x in bins.index))]
+        #need to reset the bins indeces on the pixels so they range 0-X
+        pixels['bin1_id'] = pixels['bin1_id'] - bins.index[0]
+        pixels['bin2_id'] = pixels['bin2_id'] - bins.index[0]
+        cooler.create_cooler(rc + "_" + rmatrix, bins, pixels, ordered = True, dtypes = {'count':np.float64})
+        outd[rc] = rc + "_" + rmatrix
+    log.append("Reference cooler processed")
+    for qc in qchros:
+        df = qcool.bins()[0:]
+        bins = df[df['chrom'] == qc]
+        pdf = qcool.pixels()[0:]
+        pixels = pdf[(pdf['bin1_id'].apply(lambda x:x in bins.index)) & (pdf['bin2_id'].apply(lambda x:x in bins.index))]
+        pixels['bin1_id'] = pixels['bin1_id'] - bins.index[0]
+        pixels['bin2_id'] = pixels['bin2_id'] - bins.index[0]
+        cooler.create_cooler(qc + "_" + qmatrix, bins, pixels, ordered = True, dtypes = {'count':np.float64})
+        outd[qc] = qc + "_" + qmatrix
+    log.append("Query cooler processed")
+    return outd, log
+
+def split_matrices_old(pairs, rmatrix, qmatrix, log, threads = 24):
+    '''
     Use HiCExplorer to extract unique chromosomes mentioned in the pairs file from the reference and query matrices. Parallelized step.
     '''
     #this is the first parallelized step
@@ -96,7 +134,7 @@ def split_matrices(pairs, rmatrix, qmatrix, log, threads = 24):
         for c in g:
             outd[c[2]] = c[-1]
     #once everything is all the way done, return the outd
-    return outd
+    return outd, log
 
 def start_chesses(pairs, cpd, log, threads = 24):
     '''
@@ -122,6 +160,7 @@ def start_chesses(pairs, cpd, log, threads = 24):
         log = run_commands(g, log)
 
     log.append("Chess runs complete. Total time {}".format((time.time() - start_time)/60/24)) #in hours
+    return log
 
 def main():
     args = argparser()
@@ -129,8 +168,8 @@ def main():
     try:
         #if an error happens at any point, print whatever is in the log file before quitting
         pairs = parse_bedpe(args.bedpe)
-        chro_paths = split_matrices(pairs, args.reference_hic, args.query_hic, logstrings, args.threads)
-        start_chesses(pairs, chro_paths, logstrings, args.threads)
+        chro_paths, logstrings = split_matrices(pairs, args.reference_hic, args.query_hic, logstrings, args.threads)
+        logstrings = start_chesses(pairs, chro_paths, logstrings, args.threads)
     except Exception as e:
         #print(e)
         logstrings.append("Failed with error: " + str(e))
