@@ -16,6 +16,7 @@ import glob
 import cooler
 import numpy as np
 from multiprocessing import Pool
+import pandas as pd
 
 def argparser():
     parser = argparse.ArgumentParser()
@@ -73,19 +74,19 @@ def run_commands(commands, log):
 def cooler_split(args):
     tchro, cobj, cool_name, oe_input = args #needs to be an iterable because of Pool.
     #extract the bins and pixels which match this from the selector
-    df = cobj.bins()[0:]
-    bins = df[df['chrom'] == tchro]
-    del df #delete the frames after filtering because they are nastay on the memory usage
-    pdf = cobj.pixels()[0:]
-    pixels = pdf[(pdf['bin1_id'].apply(lambda x:x in bins.index)) & (pdf['bin2_id'].apply(lambda x:x in bins.index))]
-    del pdf
+    bins = cobj.bins().fetch(tchro) #more memory efficient reading
     #need to reset the bins indeces on the pixels so they range 0-X
-    pixels['bin1_id'] = pixels['bin1_id'] - bins.index[0]
-    pixels['bin2_id'] = pixels['bin2_id'] - bins.index[0]
     if not oe_input:
         #the values are already corrected when the O/E was calculated (I think) so they should be fine as is if its O/E
         #otherwise apply the correction factors for the two bins involved first
-        pixels['count'] = [p['count'] * (bins.loc[p.bin1_id].weight * bins.loc[p.bin2_id].weight) for i,p in pixels.iterrows()]
+        matrix = cobj.matrix(balance = True, as_pixels = True).fetch(tchro)
+        #create a pixels frame setting the count column equal to the matrix fetch balance column
+        pixels = pd.DataFrame({'bin1_id':matrix['bin1_id'], 'bin2_id':matrix['bin2_id'], 'count':matrix['balanced']})
+    else:
+        #there is no weights, just get the raw pixel values as presented (should be o/e transformed)
+        pixels = cobj.pixels().fetch(tchro)
+    pixels['bin1_id'] = pixels['bin1_id'] - bins.index[0]
+    pixels['bin2_id'] = pixels['bin2_id'] - bins.index[0]
     cooler.create_cooler(tchro + "_" + cool_name, bins, pixels, ordered = True, dtypes = {'count':np.float64})
     return tchro + "_" + cool_name
 
@@ -106,11 +107,11 @@ def split_matrices(pairs, rmatrix, qmatrix, log, oe_input, threads = 24):
     #before proceeding, check that these files do not already exist
     #the filenames are keyed as rc + "_" + rmatrix for example
     fcommands = []
-    for tc, tcool, tmat in commands:
+    for tc, tcool, tmat, oei in commands:
         if tc + "_" + tmat in glob.glob("*cool"):
             outd[tc] = tc + "_" + tmat
         else:
-            fcommands.append((tc, tcool, tmat, oe_input))
+            fcommands.append((tc, tcool, tmat, oei))
     log.append("{} coolers already exist; creating {}".format(len(commands)-len(fcommands), len(fcommands)))    
     #break the command set into chunks of 24
     #may add a divider here on the number of threads to limit memory problems.
