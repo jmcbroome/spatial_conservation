@@ -7,6 +7,7 @@
 
 import argparse
 from subprocess import Popen
+import subprocess
 import sys
 import time
 import math
@@ -14,12 +15,14 @@ import traceback
 import glob
 import cooler
 import numpy as np
+from multiprocessing import Pool
 
 def argparser():
     parser = argparse.ArgumentParser()
     parser.add_argument('-v', '--verbose', action = 'store_true', help = "Print status updates.")
     parser.add_argument('-t', '--threads', type = int, help = 'Maximum number of threads to use across all CHESS processes. Default 24', default = 24)
     parser.add_argument('-l', '--log', help = 'Name of a log file to track all chromosome splittings and chess runs.', default = 'parallel_chess_log.txt')
+    parser.add_argument('-oe', '--observed_expected', action = 'store_true', help = 'Use if the input is already O/E transformed to avoid the CHESS implementation of O/E correction.')
     parser.add_argument('reference_hic', help = 'Path to position 1 (reference) O/E hic matrix in cooler format')
     parser.add_argument('query_hic', help = 'Path to position 2 (query) O/E hic matrix in cooler format')
     parser.add_argument('bedpe', help = 'Path to a bedpe file representing contact pairs of interest')
@@ -55,7 +58,8 @@ def chunks(lst, n):
         yield lst[i:i + n]    
 
 def run_commands(commands, log):
-    procs = [Popen(com) for com in commands]
+    #print("QC: First ten commands in chess set ", len(commands[:10]), commands[:10], file = sys.stderr)
+    procs = [Popen(' '.join(com), shell = True, stdout = subprocess.PIPE) for com in commands]
     for p in procs:
         pstdout, pstderr = p.communicate()
         logv = p.args
@@ -63,14 +67,32 @@ def run_commands(commands, log):
             logv.append(pstdout)
         if pstderr:
             logv.append(pstderr)
-        log.append('\t'.join(logv))
+        log.append('\t'.join([l if type(l) == str else l.decode('utf-8') for l in logv]))
     return log
 
-def split_matrices(pairs, rmatrix, qmatrix, log, threads = 24):
+def cooler_split(args):
+    tchro, cobj, cool_name, oe_input = args #needs to be an iterable because of Pool.
+    #extract the bins and pixels which match this from the selector
+    df = cobj.bins()[0:]
+    bins = df[df['chrom'] == tchro]
+    del df #delete the frames after filtering because they are nastay on the memory usage
+    pdf = cobj.pixels()[0:]
+    pixels = pdf[(pdf['bin1_id'].apply(lambda x:x in bins.index)) & (pdf['bin2_id'].apply(lambda x:x in bins.index))]
+    del pdf
+    #need to reset the bins indeces on the pixels so they range 0-X
+    pixels['bin1_id'] = pixels['bin1_id'] - bins.index[0]
+    pixels['bin2_id'] = pixels['bin2_id'] - bins.index[0]
+    if not oe_input:
+        #the values are already corrected when the O/E was calculated (I think) so they should be fine as is if its O/E
+        #otherwise apply the correction factors for the two bins involved first
+        pixels['count'] = [p['count'] * (bins.loc[p.bin1_id].weight * bins.loc[p.bin2_id].weight) for i,p in pixels.iterrows()]
+    cooler.create_cooler(tchro + "_" + cool_name, bins, pixels, ordered = True, dtypes = {'count':np.float64})
+    return tchro + "_" + cool_name
+
+def split_matrices(pairs, rmatrix, qmatrix, log, oe_input, threads = 24):
     '''
     Use the cooler API to create new subcoolers representing various individual chromosomes in the set for downstream parallelization.
     Doesn't suffer from chromosome name inconsistency issues in the same way the hicexplorer implementation does
-    Not multithreaded but that shouldn't add much overall to the runtime for this step.
     '''
     rchros = list(set([k[0] for k in pairs.keys()]))
     qchros = list(set([k[1] for k in pairs.keys()]))
@@ -78,28 +100,34 @@ def split_matrices(pairs, rmatrix, qmatrix, log, threads = 24):
     outd = {}
     rcool = cooler.Cooler(rmatrix)
     qcool = cooler.Cooler(qmatrix)
-    for rc in rchros:
-        #extract the bins and pixels which match this from the selector
-        df = rcool.bins()[0:]
-        bins = df[df['chrom'] == rc]
-        pdf = rcool.pixels()[0:]
-        pixels = pdf[(pdf['bin1_id'].apply(lambda x:x in bins.index)) & (pdf['bin2_id'].apply(lambda x:x in bins.index))]
-        #need to reset the bins indeces on the pixels so they range 0-X
-        pixels['bin1_id'] = pixels['bin1_id'] - bins.index[0]
-        pixels['bin2_id'] = pixels['bin2_id'] - bins.index[0]
-        cooler.create_cooler(rc + "_" + rmatrix, bins, pixels, ordered = True, dtypes = {'count':np.float64})
-        outd[rc] = rc + "_" + rmatrix
-    log.append("Reference cooler processed")
-    for qc in qchros:
-        df = qcool.bins()[0:]
-        bins = df[df['chrom'] == qc]
-        pdf = qcool.pixels()[0:]
-        pixels = pdf[(pdf['bin1_id'].apply(lambda x:x in bins.index)) & (pdf['bin2_id'].apply(lambda x:x in bins.index))]
-        pixels['bin1_id'] = pixels['bin1_id'] - bins.index[0]
-        pixels['bin2_id'] = pixels['bin2_id'] - bins.index[0]
-        cooler.create_cooler(qc + "_" + qmatrix, bins, pixels, ordered = True, dtypes = {'count':np.float64})
-        outd[qc] = qc + "_" + qmatrix
-    log.append("Query cooler processed")
+    #pool this
+    #define an iterable of arguments
+    commands = [(rc, rcool, rmatrix, oe_input) for rc in rchros] + [(qc, qcool, qmatrix, oe_input) for qc in qchros]
+    #before proceeding, check that these files do not already exist
+    #the filenames are keyed as rc + "_" + rmatrix for example
+    fcommands = []
+    for tc, tcool, tmat in commands:
+        if tc + "_" + tmat in glob.glob("*cool"):
+            outd[tc] = tc + "_" + tmat
+        else:
+            fcommands.append((tc, tcool, tmat, oe_input))
+    log.append("{} coolers already exist; creating {}".format(len(commands)-len(fcommands), len(fcommands)))    
+    #break the command set into chunks of 24
+    #may add a divider here on the number of threads to limit memory problems.
+    if len(fcommands) > 0:
+        for group in chunks(fcommands, threads):
+            with Pool(processes=threads) as pool:
+                for nn in pool.imap_unordered(cooler_split, group):
+                    outd[nn.split('_')[0]] = nn
+    log.append("Coolers processed.") #I really do need to learn the actual python Logging module at some point so I don't look silly. 
+#    for rc in rchros:
+#        nn = cooler_split(rc, rcool, rmatrix)
+#        outd[rc] = nn
+#    log.append("Reference cooler processed")
+#    for qc in qchros:
+#        nn = cooler_split(qc, qcool, qmatrix)
+#        outd[qc] = nn
+#    log.append("Query cooler processed")
     return outd, log
 
 def split_matrices_old(pairs, rmatrix, qmatrix, log, threads = 24):
@@ -136,7 +164,7 @@ def split_matrices_old(pairs, rmatrix, qmatrix, log, threads = 24):
     #once everything is all the way done, return the outd
     return outd, log
 
-def start_chesses(pairs, cpd, log, threads = 24):
+def start_chesses(pairs, cpd, log, threads = 24, oe_input = False):
     '''
     For each chromosome pair and regions in pairs, write the regions to a text file and start a chess command using that text file and the paths to the chromosome files created in the previous step. Parallelized.
     '''
@@ -150,8 +178,18 @@ def start_chesses(pairs, cpd, log, threads = 24):
     #now that those are created, time to start more popens
     #calculate the number of threads I can use per command
     #one command per entry in pairs
-    maxt = math.floor(threads / min(len(pairs),24)) #if I have 12 pairs, that's 2 threads per command, etc. Always gives back at least 1 thread.
-    chess_commands = [['chess', 'sim', '--oe-input', '--background-query', '--limit-background', '-p', str(maxt), cpd[k[0]], cpd[k[1]], bed_d[k], '_'.join([cpd[k[0]], cpd[k[1]], '_chess.txt'])] for k in pairs.keys()]
+    maxt = max(1,math.floor(threads / min(len(pairs),24))) #if I have 12 pairs, that's 2 threads per command, etc. Always gives back at least 1 thread.
+    #WARNING: THIS IS A HORRIBLE HACK REQUIRED BECAUSE THE CHROMOSOME NAMES FOR THE DOG TEST SET HAVE UNDERSCORES
+    #NEED SOMETHING SMARTER IN THE FUTURE. IT WILL BREAK IMMEDIATELY ON THE NEXT THING.
+    if oe_input:
+        chess_commands = [['chess', 'sim', '--oe-input', '--background-query', '--limit-background', '-p', str(maxt), cpd[k[0]], cpd[k[1]], bed_d[k], '_'.join([cpd[k[0]].split("_")[0], '-'.join(cpd[k[1]].split("_")[:3]), 'chess.txt'])] for k in pairs.keys()]
+    else:
+        #same command without the O-E parameter, basically.
+        chess_commands = [['chess', 'sim', '--background-query', '--limit-background', '-p', str(maxt), cpd[k[0]], cpd[k[1]], bed_d[k], '_'.join([cpd[k[0]].split("_")[0], '-'.join(cpd[k[1]].split("_")[:3]), 'chess.txt'])] for k in pairs.keys()]
+    if oe_input:
+        log.append("Running with precalculated O/E")
+    else:
+        log.append("Calculating O/E within CHESS")
     group_commands = chunks(chess_commands, threads) #groups of up to 24. 
     log.append("Starting CHESS runs- {} total runs, using {} threads each".format(len(chess_commands), maxt))
     start_time = time.time()
@@ -168,8 +206,10 @@ def main():
     try:
         #if an error happens at any point, print whatever is in the log file before quitting
         pairs = parse_bedpe(args.bedpe)
-        chro_paths, logstrings = split_matrices(pairs, args.reference_hic, args.query_hic, logstrings, args.threads)
-        logstrings = start_chesses(pairs, chro_paths, logstrings, args.threads)
+        chro_paths, logstrings = split_matrices(pairs, args.reference_hic, args.query_hic, logstrings, args.observed_expected, args.threads)
+        if args.verbose:
+            print("QC: chro paths identified", chro_paths.keys(), file = sys.stdout)
+        logstrings = start_chesses(pairs, chro_paths, logstrings, args.threads, args.observed_expected)
     except Exception as e:
         #print(e)
         logstrings.append("Failed with error: " + str(e))
