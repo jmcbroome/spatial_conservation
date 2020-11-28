@@ -88,7 +88,7 @@ def cooler_split(args):
     pixels['bin1_id'] = pixels['bin1_id'] - bins.index[0]
     pixels['bin2_id'] = pixels['bin2_id'] - bins.index[0]
     cooler.create_cooler(tchro + "_" + cool_name, bins, pixels, ordered = True, dtypes = {'count':np.float64})
-    return tchro + "_" + cool_name
+    return tchro, tchro + "_" + cool_name
 
 def split_matrices(pairs, rmatrix, qmatrix, log, oe_input, threads = 24):
     '''
@@ -118,8 +118,8 @@ def split_matrices(pairs, rmatrix, qmatrix, log, oe_input, threads = 24):
     if len(fcommands) > 0:
         for group in chunks(fcommands, threads):
             with Pool(processes=threads) as pool:
-                for nn in pool.imap_unordered(cooler_split, group):
-                    outd[nn.split('_')[0]] = nn
+                for tc, nn in pool.imap_unordered(cooler_split, group):
+                    outd[tc] = nn
     log.append("Coolers processed.") #I really do need to learn the actual python Logging module at some point so I don't look silly. 
 #    for rc in rchros:
 #        nn = cooler_split(rc, rcool, rmatrix)
